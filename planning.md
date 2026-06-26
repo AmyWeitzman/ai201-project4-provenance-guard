@@ -1,6 +1,6 @@
 # Provenance Guard — Planning Document
 
-## System Diagrams
+## Architecture
 
 ### Flow 1: Submission
 
@@ -56,6 +56,8 @@ POST /submissions
            └───────────────────────────────────────┘
 ```
 
+A submission passes through a rate limiter and input validator before entering the detection pipeline, where an LLM classifier (Groq) and a stylometric heuristic analyzer run independently on the text. Their scores are combined by a confidence aggregator, which classifies the content and produces a confidence score; that result flows to the label generator, which writes the plain-language transparency label, and finally to the audit logger before the response is returned to the caller.
+
 ---
 
 ### Flow 2: Appeal
@@ -84,6 +86,8 @@ POST /appeals/{content_id}
 │  confirmation message        │
 └──────────────────────────────┘
 ```
+
+When a user believes their content was misclassified, they submit an appeal with their reasoning. The appeals handler looks up the original decision by content ID, appends the appeal record to that log entry without overwriting the original verdict, and sets the status to "under review" so a human reviewer can evaluate the case alongside the full signal breakdown.
 
 ---
 
@@ -126,32 +130,130 @@ If a user believes their content was misclassified, they can submit an appeal. T
 
 **Blind spots:** This signal measures form, not meaning. A human who writes in a deliberately controlled style (academic writing, technical documentation, minimalist fiction) will score as AI-like. Conversely, an AI prompted to produce varied sentence lengths and unusual vocabulary can defeat it. It also has no sense of context - a short poem and a long essay will produce very different raw statistics regardless of authorship, so the signal is more reliable on longer texts.
 
+### Output format and combination
+
+Both signals produce a float between 0.0 and 1.0, where 0.0 = AI-generated and 1.0 = human-authored. Neither signal produces a binary flag - the score is continuous so that uncertainty can be expressed at every step.
+
+**Classification rule:** If both signals score strictly above 0.5, classify as `human_authored`. If both score strictly below 0.5, classify as `ai_generated`. Any other case - one above and one below, or either signal exactly at 0.5 — classifies as `uncertain`. A score of exactly 0.5 means the signal could not lean either way, which is maximum uncertainty.
+
+**Combined confidence score:** Take a weighted average of the two scores - LLM weighted at 0.6, stylometric at 0.4. Then convert to a confidence value by measuring how far the weighted average is from the midpoint (0.5) and scaling to [0.0, 1.0]. A weighted average of 0.9 produces a high confidence human result; a weighted average of 0.1 produces a high confidence AI result; a weighted average near 0.5 produces low confidence regardless of direction. When signals disagree (one above 0.5, one below), subtract an additional penalty proportional to how far apart they are, pushing the score toward 0.5 and surfacing the uncertainty.
+
 ---
 
-## The False Positive Problem
+## Uncertainty Representation
 
-A false positive here means the system classifies a human writer's work as AI-generated. This is the failure mode that matters most, because it's the one that harms real people.
+**What a confidence score of 0.6 means:** Both signals leaned in the same direction, but neither strongly. The system has a mild lean - not enough to be trusted for a firm verdict. A 0.6 confidence gets the uncertain label.
 
-**The scenario:** A human writer submits a polished short story. Their style is clean and deliberate - consistent sentence rhythm, formal vocabulary, sparse punctuation. They have worked hard to make it read smoothly.
+**Thresholds:**
 
-**What each signal sees:**
+| Confidence | Label shown |
+| --- | --- |
+| ≥ 0.80 | High-confidence AI or high-confidence human (whichever the classification is) |
+| 0.60 – 0.79 | Uncertain - system has a lean but not enough to commit |
+| < 0.60 | Uncertain - signals were weak, conflicting, or text was too short to read reliably |
 
-The LLM signal reads coherent, well-organized prose with no rough edges. That is exactly what AI output looks like. It returns a score leaning toward AI-generated.
+The threshold for "uncertain" is set deliberately wide (everything below 0.80). This is because the cost of a wrong confident verdict falls on the user, while the cost of an uncertain verdict is only that the reader gets less information. When in doubt, default to uncertainty.
 
-The stylometric signal measures low sentence length variance, a narrow type-token ratio, and low punctuation density. Those numbers also match AI writing patterns. It returns a score leaning toward AI-generated.
+**What the score is not:** The confidence score reflects signal agreement and distance from the midpoint, not the probability of being correct. A 0.90 means both signals strongly agreed, not that the system is 90% accurate. This distinction is documented and not exposed in the label text.
 
-**Where this breaks down:** Both signals agree - and they are both wrong. Because they agree, the disagreement penalty is never applied. The confidence aggregator returns a high-confidence AI classification. The system is not uncertain; it is confidently wrong.
+---
 
-**What the label says:** The user's readers see: *"This content appears to have been generated by AI. Our system analyzed the text across multiple signals and is highly confident in this assessment."* The word "highly confident" makes this worse, not better. It signals to readers that the system is sure, when in fact the system simply cannot distinguish polished human writing from AI output.
+## Transparency Label Design
 
-**How the user appeals:** The user submits an appeal with their reasoning - they wrote this, here is their draft history, here are earlier versions. The appeals handler logs the reasoning alongside the original decision and marks the content as "under review." Nothing is automatically corrected. A human reviewer has to read it.
+Three label variants: each label is in plain, non-accusatory language and communicates what the reader should take from it without requiring them to understand the scoring system.
 
-**What this tells us about the design:**
+**High-confidence AI** (classification = `ai_generated`, confidence ≥ 0.80):
 
-The label language cannot be accusatory, even at high confidence. "Appears to have been generated by AI" is more defensible than "was generated by AI," but it still harms the user in the time between classification and appeal resolution. The appeal mechanism must be easy to find and use - it is the only correction path.
+> "This content shows strong indicators of AI generation. Our system analyzed the writing style and structure across multiple signals and found patterns consistent with AI-produced text."
 
-The deeper problem is that the system has no way to distinguish "polished human" from "average AI." The confidence score reflects agreement between signals, not actual certainty about authorship. A 0.90 confidence score means both signals strongly agreed - it does not mean the system is 90% likely to be correct. This distinction needs to be clear in how the label is written and how the score is documented.
+**High-confidence Human** (classification = `human_authored`, confidence ≥ 0.80):
 
-This scenario should inform two decisions in implementation: the label text for high-confidence AI results should acknowledge the system's limitations without undermining its purpose, and the threshold for showing "uncertain" rather than a firm verdict should probably be set conservatively so that borderline cases default to uncertainty rather than a wrong confident answer.
+> "This content shows strong indicators of human authorship. Our system analyzed the writing style and structure across multiple signals and found patterns consistent with human-produced text."
 
+**Uncertain** (classification = `uncertain`, OR confidence < 0.80):
 
+> "Our system was unable to confidently determine whether this content was written by a human or generated by AI. The signals we analyzed were either mixed or not strong enough to make a reliable attribution."
+
+Notes on language choices: "shows strong indicators of" rather than "was generated by": the label describes what the system observed, not what it knows to be true. "Unable to confidently determine" is neutral; it does not suggest the user did anything wrong.
+
+---
+
+## Appeals Workflow
+
+**Who can submit an appeal:** Any user who has the `content_id` for a submission. In a production system this would be gated to the original submitter; in this MVP, possession of the ID is the only check.
+
+**What they provide:** A `reasoning` field (required, non-empty string) - the user's explanation of why they believe the classification is wrong. The system takes the reasoning at face value and flags the decision for human review.
+
+**What the system does on receipt:**
+
+1. Looks up the `content_id` in the audit log. Returns 404 if not found.
+2. Checks that no appeal has already been filed for this entry. Returns 409 if one exists.
+3. Appends an appeal record to the existing log entry - the original classification, confidence, and signal scores are preserved unchanged.
+4. Sets the entry's `status` from `decided` to `under_review`.
+5. Returns a confirmation response with the updated status.
+
+No automated re-classification occurs. The system does not re-run signals on appeal.
+
+**What a human reviewer sees when they open the appeal queue (GET /log filtered to `under_review`):**
+
+- The original classification and confidence score
+- Both signal scores (llm_score and stylometric_score) that produced the verdict
+- The exact label text that was shown to readers
+- The user's appeal reasoning and when it was filed
+- The original submission timestamp
+
+The reviewer evaluates whether the classification was reasonable and whether the appeal has merit.
+
+---
+
+## Anticipated Edge Cases
+
+### Edge case 1: A poem that uses repetition and simple vocabulary
+
+A user submits a piece that relies on anaphora (i.e., deliberate, heavy repetition of a phrase at the start of each line) and intentionally plain language.
+
+The stylometric signal sees: very low type-token ratio (the same words repeat constantly), low sentence length variance (lines are structurally parallel), conventional punctuation. Every number looks like AI output. The LLM signal might recognize the repetition as a stylistic device, or it might read the deliberate simplicity as the kind of "clean" prose that AI produces.
+
+The likely result: both signals lean AI, the system returns a high-confidence AI classification, and the poet's work gets flagged. The creator has to file an appeal, and a human reviewer has to recognize that the stylistic features driving the classification are in fact the entire artistic point.
+
+This case cannot be fixed without understanding the text's intent, which neither signal can assess.
+
+### Edge case 2: An AI-generated draft that was substantially rewritten by a human
+
+A user uses an LLM to generate a rough draft, then rewrites it heavily, changing word choices, breaking up sentences, adding personal anecdotes, cutting the smooth transitions. By the time they submit it, the prose reflects their voice more than the original output.
+
+The stylometric signal now sees human-like variance, because the rewriting introduced it. The LLM signal may still detect something structurally AI-like underneath, or it may read the surface texture as human. The signals are likely to disagree, which pushes the result toward uncertain.
+
+This is actually the system working as intended - the content is genuinely hybrid, and uncertain is the honest answer. But it means creators who use AI as a drafting tool and then do substantial creative work on top will consistently get the uncertain label, even if their contribution was the majority of the creative work. The label text handles this: "unable to confidently determine" does not accuse anyone of anything.
+
+---
+
+## AI Tool Plan
+
+### M3: Submission endpoint + first signal (LLM classifier)
+
+**Spec sections to provide:** The Architecture diagram (Flow 1), the Detection Signals section (Signal 1 only), and the API contract for `POST /submissions`.
+
+**What to ask the AI tool to generate:** A Flask app skeleton with a single `POST /submissions` route that accepts a text body and returns a stub response, plus a standalone `classify_with_llm(text: str) -> float` function that sends the text to Groq and parses the response into a score between 0.0 and 1.0. 
+
+**How to verify before wiring up:** Call `classify_with_llm()` directly on three inputs - a clearly AI-sounding paragraph (smooth, coherent, zero rough edges), a clearly human-sounding one (informal, idiosyncratic, uneven), and a borderline case. Check that the scores go in the expected direction and that the function doesn't crash when Groq returns an unexpected format. 
+
+---
+
+### M4: Second signal + confidence scoring
+
+**Spec sections to provide:** The Architecture diagram (Flow 1), the Detection Signals section (Signal 2 + the Output format and combination subsection), and the Uncertainty Representation section including the threshold table.
+
+**What to ask the AI tool to generate:** A standalone `compute_stylometric_score(text: str) -> float` function that computes sentence length variance, type-token ratio, and punctuation density and returns a combined score in [0.0, 1.0], plus an `aggregate_confidence(llm_score: float, stylometric_score: float) -> dict` function that implements the weighted average, classification rule (strictly above/below 0.5), and disagreement penalty.
+
+**What to check:** Run the aggregator on four combinations - both signals high (should be high-confidence human), both signals low (should be high-confidence AI), signals split (should be uncertain with confidence < 0.6), both exactly 0.5 (should be uncertain). Also check that a 0.95 agreement produces a meaningfully higher confidence than a 0.6 agreement.
+
+---
+
+### M5: Production layer — labels, appeals, and audit log
+
+**Spec sections to provide:** The Architecture diagrams (both Flow 1 and Flow 2), the Transparency Label Design section (all three variants with exact text), the Appeals Workflow section, and the API contract for `POST /appeals/{content_id}` and `GET /log`.
+
+**What to ask the AI tool to generate:** A `generate_label(classification: str, confidence: float) -> str` function that returns the correct label text for each of the three variants, the `POST /appeals/{content_id}` endpoint with 404/409 error handling, and the `GET /log` endpoint that returns the full audit log.
+
+**How to verify:** Hit the submission endpoint with inputs that should produce each of the three labels and confirm the exact label text matches the spec - not just the classification, but the full string. Then file an appeal against one of the logged entries and call `GET /log` to confirm the appeal is present and the status is `under_review`. Attempt a second appeal on the same entry and confirm a 409 is returned.
