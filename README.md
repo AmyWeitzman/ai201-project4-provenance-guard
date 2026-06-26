@@ -120,11 +120,15 @@ If a user believes their content was misclassified, they submit a `POST /appeal`
 
 ## Detection Signals
 
-### Why two signals, and why these two
+### Why three signals, and why these three
 
-The core design decision was to use signals that are genuinely independent - not two variations of the same thing. An LLM classifier and a stylometric heuristic measure completely different properties of text: one reads meaning, the other reads structure. That independence is key: when both signals agree, it is evidence from two separate observations, not one observation counted twice. When they disagree, that disagreement itself is information - the system treats it as uncertainty rather than averaging it away.
+The three signals cover three separate layers of analysis: semantic meaning (LLM), text structure (stylometric), and vocabulary (informality). Each is genuinely independent. When all three agree, the confidence is high because three separate observations converged. When they split, the system reverts to uncertainty rather than forcing a decision.
 
-The other reason for two signals is interpretability. A single black-box score is hard to explain to a creator contesting a verdict. Surfacing both signal scores in the response and the audit log means a reviewer can see why the system decided what it did: "the LLM read it as AI, but the stylometric signal was split" is a much more useful starting point for a human reviewer than "confidence: 0.63."
+All three scores are returned in the response and logged in the audit record, so a reviewer reading an appeal can see exactly where the signals diverged: "the LLM called it AI and the stylometric agreed, but the informality signal was solidly human" is actionable in a way that a single opaque number is not.
+
+**Voting and weighting:**
+
+Classification uses a majority vote: if 2 or more signals are strictly above 0.5, the content is classified `human_authored`; if 2 or more are strictly below 0.5, it is `ai_generated`; any other split is `uncertain`. Confidence uses a weighted average reflecting each signal's reliability: LLM 0.50, stylometric 0.30, informality 0.20. The LLM carries the most weight because it reads meaning holistically; the informality signal carries the least because its features (contractions, discourse markers) are easily manipulated.
 
 ### Signal 1: LLM semantic classifier (Groq)
 
@@ -136,7 +140,7 @@ The text is sent to `llama-3.1-8b-instant` via Groq with a prompt that describes
 
 **What it misses:** It can be fooled by deliberate prompting — an AI told to "write casually, with typos" may score as human. It also penalizes polished human writers whose consistent prose looks like well-prompted LLM output. It cannot detect AI content that a human has substantially rewritten, because editing changes the surface texture the model reads. Perhaps most critically: the classifier is itself an LLM, so it has structural blind spots about what AI writing looks like from the outside — it may not recognize patterns that differ between models or that only appear in certain fine-tuned variants.
 
-### Signal 2: Stylometric heuristics (pure Python)
+### Signal 2: Stylometric heuristics (Python)
 
 Three structural statistics are computed directly from the text with no model inference:
 
@@ -148,9 +152,25 @@ Each sub-score is in [0.0, 1.0] and the three are averaged into a single `stylom
 
 **What it measures:** How the text is built structurally, independent of meaning or topic.
 
-**Why this signal:** It runs in pure Python with no API calls, adds no latency, and is completely transparent - every sub-score can be explained in one sentence. 
+**Why this signal:** It runs in pure Python with no API calls, adds no latency, and is completely transparent - every sub-score can be explained in one sentence. It is also complementary to the LLM signal: no opinion about meaning, only form.
 
-**What it misses:** It measures form, not intent. Professional, academic text with long words, uniform sentence length, and no expressive punctuation would score as AI-like. It is also unreliable on very short texts (under ~100 words), where sentence variance is low by definition and word counts are too small for meaningful statistics. Originally this signal included type-token ratio (TTR)(vocabulary diversity), but TTR saturates on short texts - nearly every word is unique in a 40-word passage regardless of authorship - so it was replaced with average word length, which is length-invariant.
+**What it misses:** It measures form, not intent. Professional, academic text with long words, uniform sentence length, and no expressive punctuation would score as AI-like. It is also unreliable on very short texts (under ~100 words), where sentence variance is low by definition and word counts are too small for meaningful statistics. Originally this signal included type-token ratio (TTR), but TTR saturates on short texts - nearly every word is unique in a 40-word passage regardless of authorship - so it was replaced with average word length, which is length-invariant.
+
+### Signal 3: Informality / vocabulary (Python)
+
+Three vocabulary-level features are counted directly from the text:
+
+- **Contraction rate:** Contractions ("can't", "it's", "I've", etc.) indicate informal vocabulary. AI text avoids them by default. Score: contractions per 100 words / 3.0, capped at 1.0.
+- **First-person pronoun density:** "I", "me", "my", "we", "our" indicate personal voice. AI text tends toward impersonal constructions. Score: first-person pronouns per 100 words / 5.0, capped at 1.0.
+- **Discourse marker density:** Words like "honestly", "actually", "anyway", "I mean", "kind of" appear in natural speech and informal writing. AI text almost never uses them unprompted. Score: markers per 100 words / 4.0, capped at 1.0.
+
+The three sub-scores are averaged into a single `informality_score`.
+
+**What it measures:** The vocab of the writing, how conversational vs. formal the vocabulary choices are, independent of both meaning and structural statistics.
+
+**Why this signal:** Vocabulary is independent of the other 2 signals. A text can be structurally varied (high stylometric score) and semantically ambiguous (LLM returns 0.5), yet have zero contractions and zero first-person pronouns, a pattern that strongly suggests AI authorship. This signal catches cases the other two miss.
+
+**What it misses:** It is the easiest signal to fool intentionally - a user who knows the system can sprinkle contractions and "honestly" into AI output to inflate the score. It is also unreliable on formal human writing: an academic paper or legal doc uses none of these features by convention, and will score 0.0 even when written entirely by a human. Short texts (under 10 words) return 0.5 by default.
 
 ### What would change for a real deployment
 
@@ -166,21 +186,21 @@ Each sub-score is in [0.0, 1.0] and the three are averaged into a single `stylom
 
 ## Confidence Scoring
 
-Both signals produce a score in [0.0, 1.0] where 0.0 = AI-generated and 1.0 = human-authored.
+All three signals produce a score in [0.0, 1.0] where 0.0 = AI-generated and 1.0 = human-authored.
 
-**Classification rule:**
+**Classification rule (majority vote):**
 
-- Both signals strictly above 0.5 -> `human_authored`
-- Both signals strictly below 0.5 -> `ai_generated`
-- Any other case (one on each side, or either exactly at 0.5) -> `uncertain`
+- 2 or more signals strictly above 0.5 -> `human_authored`
+- 2 or more signals strictly below 0.5 -> `ai_generated`
+- Any other case (split, or signals at exactly 0.5) -> `uncertain`
 
 **Confidence score formula:**
 
-1. Compute a weighted average: `weighted = 0.6 x llm_score + 0.4 x stylometric_score`. The LLM signal is weighted higher because it reads meaning, not just structure.
-2. Convert to confidence: `raw = abs(weighted - 0.5) x 2`. This scales distance from the midpoint to [0, 1] — a weighted average of 0.9 yields 0.80 confidence, a weighted average of 0.5 yields 0.0.
-3. Apply a disagreement penalty when classification is `uncertain`: `confidence = max(0, raw - abs(llm_score - stylometric_score) x 0.5)`. Signals on opposite sides of 0.5 reduce confidence proportionally to how far apart they are.
+1. Compute a weighted average: `weighted = 0.50 x llm_score + 0.30 x stylometric_score + 0.20 x informality_score`. Weights reflect each signal's reliability: the LLM reads meaning holistically; the informality signal is easiest to manipulate.
+2. Convert to confidence: `raw = abs(weighted - 0.5) x 2`. Scales distance from the midpoint to [0, 1].
+3. When classification is `uncertain`, apply a disagreement penalty equal to the standard deviation of the three scores: `confidence = max(0, raw - std_dev(scores))`. A wide spread in scores produces a stronger penalty than when signals cluster near a single value.
 
-**The confidence score reflects signal agreement, not accuracy.** A 0.97 confidence means both signals strongly agreed - it does not mean the system is 97% likely to be correct. This distinction is intentional and is reflected in label language.
+**The confidence score reflects signal agreement, not accuracy.** A 0.97 confidence means all three signals strongly agreed - it does not mean the system is 97% likely to be correct. This distinction is intentional and is reflected in label language.
 
 **How I validated the scores are meaningful:**
 

@@ -117,37 +117,80 @@ def compute_stylometric_score(text: str) -> float:
     return round((sentence_score + ttr_score + punct_score) / 3, 4)
 
 
+# ── Signal 3: Informality / register ─────────────────────────────────────────
+
+_CONTRACTIONS = re.compile(
+    r"\b(can't|won't|don't|didn't|isn't|aren't|wasn't|weren't|"
+    r"it's|that's|what's|there's|i'm|i've|i'd|i'll|"
+    r"you're|you've|you'd|you'll|he's|she's|they're|we're|"
+    r"could've|would've|should've|couldn't|wouldn't|shouldn't|"
+    r"hasn't|haven't|hadn't|doesn't|let's)\b",
+    re.IGNORECASE,
+)
+_FIRST_PERSON = re.compile(
+    r"\b(i|me|my|mine|myself|we|our|ours|ourselves)\b",
+    re.IGNORECASE,
+)
+_DISCOURSE = re.compile(
+    r"\b(well|anyway|actually|honestly|literally|basically|totally|"
+    r"i mean|kind of|sort of|you know|okay|ok|nah|yeah|yep|nope)\b",
+    re.IGNORECASE,
+)
+
+
+def compute_informality_score(text: str) -> float:
+    """
+    Returns a score in [0.0, 1.0]: 0.0 = formal/AI-like, 1.0 = informal/human-like.
+    Averages three sub-scores: contraction rate, first-person pronoun density,
+    and informal discourse marker density.
+    Returns 0.5 if the text is too short to analyze reliably (< 10 words).
+    """
+    words = _tokenize(text)
+    if len(words) < 10:
+        return 0.5
+
+    per_100 = 100.0 / len(words)
+    contraction_score = min(len(_CONTRACTIONS.findall(text)) * per_100 / 3.0, 1.0)
+    first_person_score = min(len(_FIRST_PERSON.findall(text)) * per_100 / 5.0, 1.0)
+    discourse_score = min(len(_DISCOURSE.findall(text)) * per_100 / 4.0, 1.0)
+
+    return round((contraction_score + first_person_score + discourse_score) / 3, 4)
+
+
 # ── Confidence aggregator ─────────────────────────────────────────────────────
 
-def aggregate_confidence(llm_score: float, stylometric_score: float) -> dict:
+def aggregate_confidence(llm_score: float, stylometric_score: float, informality_score: float) -> dict:
     """
-    Combines both signal scores into a classification and confidence score.
+    Combines three signal scores into a classification and confidence score.
 
-    Classification rule (from spec):
-      - Both strictly above 0.5 → human_authored
-      - Both strictly below 0.5 → ai_generated
-      - Any other case (disagreement or either = 0.5) → uncertain
+    Classification: majority vote across three signals.
+      - 2 or more signals strictly > 0.5 → human_authored
+      - 2 or more signals strictly < 0.5 → ai_generated
+      - Otherwise (split or ties at 0.5) → uncertain
 
-    Confidence:
-      - Weighted average (LLM 0.6, stylometric 0.4), converted to distance from 0.5
-      - Disagreement penalty applied when classification is uncertain
+    Confidence: weighted average (LLM 0.50, stylometric 0.30, informality 0.20),
+    converted to distance from midpoint [0, 1].
+    When uncertain, a penalty equal to the std dev of the three scores is applied
+    to reflect how spread apart the signals are.
     """
-    if llm_score > 0.5 and stylometric_score > 0.5:
+    scores = [llm_score, stylometric_score, informality_score]
+    votes_human = sum(1 for s in scores if s > 0.5)
+    votes_ai = sum(1 for s in scores if s < 0.5)
+
+    if votes_human >= 2:
         classification = "human_authored"
-    elif llm_score < 0.5 and stylometric_score < 0.5:
+    elif votes_ai >= 2:
         classification = "ai_generated"
     else:
         classification = "uncertain"
 
-    weighted_avg = 0.6 * llm_score + 0.4 * stylometric_score
-
-    # Distance from midpoint scaled to [0, 1]
+    weighted_avg = 0.50 * llm_score + 0.30 * stylometric_score + 0.20 * informality_score
     raw_confidence = abs(weighted_avg - 0.5) * 2
 
-    # Disagreement penalty: proportional to how far apart the two signals are
     if classification == "uncertain":
-        penalty = abs(llm_score - stylometric_score) * 0.5
-        raw_confidence = max(0.0, raw_confidence - penalty)
+        mean = sum(scores) / 3
+        std_dev = math.sqrt(sum((s - mean) ** 2 for s in scores) / 3)
+        raw_confidence = max(0.0, raw_confidence - std_dev)
 
     return {
         "classification": classification,

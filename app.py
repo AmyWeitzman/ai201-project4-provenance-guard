@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from signals import classify_with_llm, compute_stylometric_score, aggregate_confidence
+from signals import classify_with_llm, compute_stylometric_score, compute_informality_score, aggregate_confidence
 import audit_log
 
 load_dotenv()
@@ -55,7 +55,8 @@ def submit():
 
     llm_score = classify_with_llm(text)
     stylometric_score = compute_stylometric_score(text)
-    result = aggregate_confidence(llm_score, stylometric_score)
+    informality_score = compute_informality_score(text)
+    result = aggregate_confidence(llm_score, stylometric_score, informality_score)
 
     classification = result["classification"]
     confidence = result["confidence"]
@@ -69,6 +70,7 @@ def submit():
         "confidence": confidence,
         "llm_score": round(llm_score, 2),
         "stylometric_score": round(stylometric_score, 2),
+        "informality_score": round(informality_score, 2),
         "status": "classified",
     })
 
@@ -80,6 +82,7 @@ def submit():
         "signals": {
             "llm_score": round(llm_score, 2),
             "stylometric_score": round(stylometric_score, 2),
+            "informality_score": round(informality_score, 2),
         },
     }), 200
 
