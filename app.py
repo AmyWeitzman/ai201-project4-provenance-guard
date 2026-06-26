@@ -5,6 +5,7 @@ from flask import Flask, request, jsonify
 from signals import classify_with_llm, compute_stylometric_score, compute_informality_score, aggregate_confidence
 import audit_log
 import certificates
+import analytics
 
 load_dotenv()
 
@@ -170,6 +171,11 @@ def get_certificate(certificate_id):
     if not cert:
         return jsonify({"error": "certificate not found"}), 404
     return jsonify(cert), 200
+
+
+@app.route("/analytics", methods=["GET"])
+def get_analytics():
+    return jsonify(analytics.get_summary()), 200
 
 
 @app.route("/log", methods=["GET"])

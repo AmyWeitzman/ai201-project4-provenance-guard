@@ -448,6 +448,52 @@ I asked the AI tool to implement `compute_stylometric_score(text: str) -> float`
 
 ---
 
+## Analytics Dashboard
+
+`GET /analytics` returns a summary computed from the full audit log.
+
+**Example response:**
+
+```json
+{
+  "total_submissions": 47,
+  "detection_patterns": {
+    "ai_generated":   {"count": 22, "pct": 46.8, "avg_confidence": 0.89},
+    "human_authored": {"count": 18, "pct": 38.3, "avg_confidence": 0.71},
+    "uncertain":      {"count":  7, "pct": 14.9, "avg_confidence": 0.31}
+  },
+  "high_confidence_rate": 0.68,
+  "appeal_rate": {
+    "total_appeals": 5,
+    "rate": 0.106,
+    "by_classification": {
+      "ai_generated": 3,
+      "human_authored": 1,
+      "uncertain": 1
+    }
+  },
+  "certificate_conversion": {
+    "human_authored_submissions": 18,
+    "certificates_issued": 4,
+    "conversion_rate": 0.22
+  }
+}
+```
+
+### Detection patterns
+
+Breaks down every submission by classification with count, percentage of total, and average confidence per class. Useful for spotting systemic bias - if `uncertain` is 40% of submissions the signals are probably undertrained for the content type on the platform.
+
+### Appeal rate
+
+Total appeals filed divided by total submissions, plus a breakdown of which original classification drew the most appeals. A high appeal rate on `human_authored` is a red flag - it means users whose content genuinely was human-written are getting flagged and pushing back.
+
+### Certificate conversion rate
+
+The share of `human_authored` submissions that went on to earn a provenance certificate. A low rate (say, under 5%) suggests users either don't know the feature exists or don't trust that it will help them. A high rate suggests users are actively engaging with the verification system, which is a meaningful signal of platform trust. This metric also indirectly tracks how many `verified_human` entries are in the log relative to the total human-authored pool.
+
+---
+
 ## API Endpoints
 
 ### `POST /submit`
@@ -532,6 +578,10 @@ Returns the full certificate record including `process_statement` and `statement
   "message": "Your appeal has been received and will be reviewed by our team."
 }
 ```
+
+### `GET /analytics`
+
+Returns detection patterns, appeal rate, and certificate conversion rate computed from the full audit log. See the Analytics Dashboard section for field descriptions.
 
 ### `GET /log`
 
