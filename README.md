@@ -10,27 +10,29 @@ A submission takes the following path from input to label:
 
 A user submits a piece of text (a poem, short story, blog post) to the content submission endpoint. The request first hits the rate limiter, which enforces a per-IP quota to prevent abuse and protect the cost of calling an external LLM. If the limit is exceeded, the request is rejected immediately.
 
-The text then enters the detection pipeline, which runs two independent signals:
+The text then enters the detection pipeline, which runs three independent signals:
 
-- **LLM-based classification (Groq):** The text is sent to Groq, which assesses whether the writing reads as human or AI-generated. This captures holistic semantic and stylistic properties such as tone, voice, and whether ideas develop in a naturally human way.
-- **Stylometric heuristics:** Use Python to compute measurable structural statistics such as sentence length variance, vocabulary diversity (type-token ratio), and punctuation density. AI text tends to be more uniform; human writing is more variable. This signal is fully independent from the LLM: one is semantic, one is structural.
+- **LLM semantic classifier (Groq):** The text is sent to Groq, which assesses whether the writing reads as human or AI-generated based on holistic semantic and stylistic properties — tone, voice authenticity, patterns, and whether ideas develop in a naturally human way.
+- **Stylometric heuristics:** Python computes structural statistics — sentence length variance, average word length, and punctuation density. AI text tends toward uniform structure; human writing is more variable.
+- **Informality / Vocabulary:** Contractions, first-person pronouns, and discourse markers ("honestly", "anyway", "kind of") are counted. AI text defaults to formal register; human writing uses these naturally.
 
-Both signals produce a numeric score. The confidence aggregator combines them into a single classification and confidence score. When the two signals agree strongly, confidence is high. When they disagree, a penalty is applied. A score of 0.51 from conflicting signals means something much different than a 0.95 from two signals in agreement.
+All three signals produce a score in [0.0, 1.0]. The confidence aggregator uses a majority vote for classification and a weighted average (LLM 0.50, stylometric 0.30, informality 0.20) for confidence. When the signals agree, confidence is high. When they split, a disagreement penalty is applied. A 0.51 from conflicting signals is treated very differently from a 0.95 from three signals in agreement.
 
 The classification and confidence score are passed to the label generator, which produces the transparency label shown to readers. High-confidence results get a clear human or AI attribution; low-confidence or conflicting results produce an "uncertain" label. All three variants are written in plain, non-accusatory language.
 
-Before returning the response, the audit logger records the full decision: classification, confidence score, both signal scores, the label shown, and the content's current status. Every submission is logged this way.
+Before returning the response, the audit logger records the full decision: classification, confidence, all three signal scores, the label shown, and the content's current status. Every submission is logged this way.
 
 If a user believes their content was misclassified, they can submit an appeal. The appeals handler captures their reasoning, appends it to the original log entry without overwriting it, and updates the content's status to "under review." No automated re-classification occurs; a human reviewer reads the log.
 
 1. **Rate limiter** — the request is checked against the per-IP quota before any processing begins. If the limit is exceeded, a 429 is returned immediately.
-2. **Input validator** — the request body is validated: `text` (required, min 50 characters) and `user_id` (required) must be present.
-3. **Detection pipeline** — two independent signals run on the text:
-   - The **LLM classifier** sends the text to Groq and receives a score assessing whether the writing reads as human or AI-generated.
-   - The **stylometric analyzer** computes structural statistics directly from the text in pure Python.
-4. **Confidence aggregator** — both signal scores are combined into a classification (`ai_generated`, `human_authored`, or `uncertain`) and a confidence score.
+2. **Input validator** — the request body is validated: `text` (required, min 50 characters) and `creator_id` (required) must be present.
+3. **Detection pipeline** — three independent signals run on the text:
+   - The **LLM classifier** sends the text to Groq and receives a score based on holistic semantic/stylistic analysis.
+   - The **stylometric analyzer** computes structural statistics (sentence variance, word length, punctuation density).
+   - The **informality analyzer** counts contractions, first-person pronouns, and discourse markers.
+4. **Confidence aggregator** — all three signal scores are combined via majority vote into a classification (`ai_generated`, `human_authored`, or `uncertain`) and a weighted confidence score.
 5. **Label generator** — the classification and confidence are mapped to one of three plain-language transparency labels.
-6. **Audit logger** — the full decision (both signal scores, classification, confidence, label, status) is written to the audit log before the response is returned.
+6. **Audit logger** — the full decision (all signal scores, classification, confidence, label, status) is written to the audit log before the response is returned.
 7. **Response** — the caller receives a structured JSON object with `content_id`, `classification`, `confidence`, `label`, and individual signal scores.
 
 ### Flow 1: Submission
@@ -213,14 +215,14 @@ All three signals produce a score in [0.0, 1.0] where 0.0 = AI-generated and 1.0
 
 I tested four inputs and checked whether scores varied in the expected direction:
 
-| Input | llm_score | stylometric_score | classification | confidence |
-| --- | --- | --- | --- | --- |
-| Clearly AI (formal, uniform) | 0.0 | 0.04 | ai_generated | 0.97 |
-| Clearly human (casual, informal) | 0.9 | 0.58 | human_authored | 0.55 |
-| Borderline formal human | 0.0 | 0.29 | ai_generated | 0.76 |
-| Lightly edited AI | 0.8 | 0.44 | uncertain | 0.01 |
+| Input | llm_score | stylometric_score | informality_score | classification | confidence |
+| --- | --- | --- | --- | --- | --- |
+| Clearly AI (formal, uniform) | 0.0 | 0.04 | 0.0 | ai_generated | 0.97 |
+| Clearly human (casual, informal) | 0.9 | 0.58 | 0.72 | human_authored | 0.54 |
+| Borderline formal human | 0.0 | 0.29 | 0.16 | ai_generated | 0.76 |
+| Lightly edited AI | 0.8 | 0.44 | 0.50 | uncertain | 0.11 |
 
-The scores vary meaningfully: 0.97 for a text both signals strongly agree is AI-generated vs. 0.55 for a text the LLM scores as human but the stylometric signal only weakly corroborates. The disagreement penalty is working - "lightly edited AI" produces near-zero confidence because the signals are on opposite sides and far apart.
+The scores vary meaningfully across all three signals. The clearly AI text scores 0.0/0.04/0.0 — all three signals agree strongly, producing 0.97 confidence. The lightly edited AI text (row 4) has an LLM score leaning human (edits fooled the model) but the stylometric and informality signals are on opposite sides of 0.5, producing a 1-1-1 vote split. That triggers `uncertain` and the disagreement penalty (std dev of the three scores) further reduces confidence to 0.11.
 
 **Two example submissions showing confidence variation:**
 
@@ -230,25 +232,31 @@ The scores vary meaningfully: 0.97 for a text both signals strongly agree is AI-
 {
   "classification": "ai_generated",
   "confidence": 0.97,
-  "llm_score": 0.0,
-  "stylometric_score": 0.04
+  "signals": {
+    "llm_score": 0.0,
+    "stylometric_score": 0.04,
+    "informality_score": 0.0
+  }
 }
 ```
 
-Both signals strongly agree. The LLM reads it as textbook AI output; the stylometric signal finds very long average word length and no expressive punctuation, producing a near-zero score.
+All three signals strongly agree. The LLM reads it as textbook AI output; the stylometric signal finds very long average word length and no expressive punctuation; the informality signal finds zero contractions, no first-person pronouns, and no discourse markers.
 
 **Lower-confidence case** — text submitted: *"ok so i finally tried that new ramen place downtown and honestly? underwhelming. the broth was fine but they put WAY too much sodium in it and i was thirsty for like three hours after."*
 
 ```json
 {
   "classification": "human_authored",
-  "confidence": 0.55,
-  "llm_score": 0.9,
-  "stylometric_score": 0.58
+  "confidence": 0.54,
+  "signals": {
+    "llm_score": 0.9,
+    "stylometric_score": 0.58,
+    "informality_score": 0.72
+  }
 }
 ```
 
-Both signals lean human, but neither strongly. The stylometric score of 0.58 is only slightly above the 0.5 midpoint — the text is short, the sentence variance is limited, and the punctuation density is low. The result is a correct classification with moderate confidence and the uncertain label.
+All three signals lean human. The informality signal is strong (0.72) — the text has "honestly", "so", multiple first-person references, and casual phrasing. Confidence is 0.54 because the weighted average (0.5×0.9 + 0.3×0.58 + 0.2×0.72 = 0.77) is pulled toward the human end but not far enough from center to produce high confidence — `abs(0.77 - 0.5) × 2 = 0.54`. Classification is correct and the human label fires (0.54 < 0.80 threshold, so the uncertain label is shown).
 
 ---
 
@@ -285,7 +293,7 @@ A provenance certificate is an additional layer of verification that a user can 
 Submit `POST /certify` with three fields:
 
 - `content_id` — the UUID from the original `/submit` response
-- `user_id` — must match the `user_id` used when the content was submitted
+- `creator_id` — must match the `creator_id` used when the content was submitted
 - `process_statement` — at least 100 characters describing how the content was written (what the piece is about, what creative choices were made, where inspiration came from)
 
 The system runs two checks before issuing:
@@ -301,7 +309,7 @@ If both checks pass, a certificate is written to `certificates.json`, and the au
 {
   "certificate_id": "uuid",
   "content_id": "uuid",
-  "user_id": "string",
+  "creator_id": "string",
   "process_statement": "The user's explanation...",
   "statement_score": 0.87,
   "issued_at": "2026-06-26T04:10:22.000000+00:00"
@@ -367,19 +375,21 @@ Requests 1-10 succeed. Requests 11-12 return `429 Too Many Requests`.
 
 Every attribution decision is written to `audit_log.json` as a structured, newline-delimited JSON entry. Appeals are appended to the original entry in-place — the original decision is preserved and the appeal fields are added alongside it.
 
-Each entry captures: `content_id`, `user_id`, `timestamp`, `attribution`, `confidence`, `llm_score`, `stylometric_score`, `status`, and (when filed) `appeal_reasoning` and `appeal_timestamp`.
+Each entry captures: `content_id`, `creator_id`, `content_type`, `timestamp`, `attribution`, `confidence`, `llm_score`, `stylometric_score`, `informality_score`, `status`, and (when filed) `appeal_reasoning` and `appeal_timestamp`.
 
 **Three log entries from `GET /log`:**
 
 ```json
 {
   "content_id": "cdcd2fe7-4aa5-4c5a-9849-9d27bde93830",
-  "user_id": "demo-user-1",
+  "creator_id": "demo-user-1",
+  "content_type": "text",
   "timestamp": "2026-06-26T02:26:09.915746+00:00",
   "attribution": "ai_generated",
   "confidence": 0.97,
   "llm_score": 0.0,
   "stylometric_score": 0.04,
+  "informality_score": 0.0,
   "status": "classified"
 }
 ```
@@ -387,12 +397,14 @@ Each entry captures: `content_id`, `user_id`, `timestamp`, `attribution`, `confi
 ```json
 {
   "content_id": "3c154853-80f0-49b8-a6ca-57d8a5ff2967",
-  "user_id": "demo-user-2",
+  "creator_id": "demo-user-2",
+  "content_type": "text",
   "timestamp": "2026-06-26T02:26:17.017954+00:00",
   "attribution": "human_authored",
-  "confidence": 0.55,
+  "confidence": 0.54,
   "llm_score": 0.9,
   "stylometric_score": 0.58,
+  "informality_score": 0.72,
   "status": "classified"
 }
 ```
@@ -400,12 +412,14 @@ Each entry captures: `content_id`, `user_id`, `timestamp`, `attribution`, `confi
 ```json
 {
   "content_id": "0ec50a68-b08f-42c1-a7fb-080caa8a3af7",
-  "user_id": "demo-user-3",
+  "creator_id": "demo-user-3",
+  "content_type": "text",
   "timestamp": "2026-06-26T02:26:23.986448+00:00",
   "attribution": "ai_generated",
   "confidence": 0.76,
   "llm_score": 0.0,
   "stylometric_score": 0.29,
+  "informality_score": 0.16,
   "status": "under_review",
   "appeal_reasoning": "I am an economics PhD student and wrote this passage myself for a blog post. My academic training produces formal prose that may resemble AI output stylistically, but this is my original analysis.",
   "appeal_timestamp": "2026-06-26T02:26:32.154500+00:00"
@@ -568,7 +582,7 @@ The share of `human_authored` submissions that went on to earn a provenance cert
 ```json
 {
   "text": "string (required, min 50 characters)",
-  "user_id": "string (required)"
+  "creator_id": "string (required)"
 }
 ```
 
@@ -595,7 +609,7 @@ The share of `human_authored` submissions that went on to earn a provenance cert
 ```json
 {
   "content_id": "uuid from /submit response",
-  "user_id": "string (must match original submission)",
+  "creator_id": "string (must match original submission)",
   "process_statement": "string (required, min 100 characters)"
 }
 ```
@@ -615,7 +629,7 @@ The share of `human_authored` submissions that went on to earn a provenance cert
 **Error cases:**
 
 - `404` — `content_id` not found
-- `403` — `user_id` does not match the content's user
+- `403` — `creator_id` does not match the content's user
 - `422` — content is not `human_authored`, process statement is too short, or statement fails LLM verification (includes `statement_score` in response)
 - `409` — certificate already issued for this content
 
