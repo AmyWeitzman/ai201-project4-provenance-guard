@@ -448,6 +448,71 @@ I asked the AI tool to implement `compute_stylometric_score(text: str) -> float`
 
 ---
 
+## Multi-Modal Support
+
+`POST /submit` accepts an optional `content_type` field. Supported values: `"text"`, `"code"`. The default is `"text"`. 
+
+The pipeline branches on content type before running signals. The confidence aggregator and classification rule are identical for both types - only the signal functions change.
+
+### Content type: `text` (default)
+
+For prose writing (poems, stories, blog posts, essays). The three signals are:
+
+| Signal | Function | What it measures |
+| --- | --- | --- |
+| `llm_score` | `classify_with_llm` | Holistic semantic/stylistic character of the text |
+| `stylometric_score` | `compute_stylometric_score` | Sentence length variance, avg word length, punctuation density |
+| `informality_score` | `compute_informality_score` | Contractions, first-person pronouns, discourse markers |
+
+### Content type: `code`
+
+For source code (Python, JavaScript, any language). The three signals are:
+
+| Signal | Function | What it measures |
+| --- | --- | --- |
+| `llm_score` | `classify_code_with_llm` | Documentation density, variable naming, completeness patterns |
+| `code_structure_score` | `compute_code_structure_score` | Comment ratio, line length variance, avg line length |
+| `text_stylometric_score` | `compute_stylometric_score` | Text metrics applied to the code's prose content (comments, strings) |
+
+The code LLM prompt is tuned for developer writing patterns: AI-generated code is heavily documented with comprehensive docstrings and full error handling; human-written code tends toward short variable names, sparse comments, and ad-hoc solutions.
+
+The `code_structure_score` sub-scores:
+
+- **Comment density:** Lines starting with `#`, `//`, or `"""` as a ratio of total non-empty lines. High ratio -> AI over-documentation -> lower score.
+- **Line length variance:** Standard deviation of line lengths. Low variance -> AI's consistent style -> lower score.
+- **Avg line length:** Shorter average → human-like (short names, minimal lines). Score: `max(0, 1 - (mean - 15) / 40)`.
+
+**Example code submission:**
+
+```bash
+curl -s -X POST http://localhost:5000/submit \
+  -H "Content-Type: application/json" \
+  -d '{
+    "text": "def avg(nums):\n    # TODO: handle empty\n    return sum(nums)/len(nums)",
+    "creator_id": "dev-user-1",
+    "content_type": "code"
+  }'
+```
+
+```json
+{
+  "content_id": "uuid",
+  "content_type": "code",
+  "classification": "human_authored",
+  "confidence": 0.81,
+  "label": "This content shows strong indicators of human authorship...",
+  "signals": {
+    "llm_score": 0.9,
+    "code_structure_score": 0.78,
+    "text_stylometric_score": 0.61
+  }
+}
+```
+
+The signal names in the response and audit log differ by content type - `code_structure_score` and `text_stylometric_score` appear for `code` submissions; `stylometric_score` and `informality_score` appear for `text` submissions.
+
+---
+
 ## Analytics Dashboard
 
 `GET /analytics` returns a summary computed from the full audit log.

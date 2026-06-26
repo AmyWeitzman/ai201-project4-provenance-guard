@@ -2,7 +2,11 @@ import uuid
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-from signals import classify_with_llm, compute_stylometric_score, compute_informality_score, aggregate_confidence
+from signals import (
+    classify_with_llm, classify_code_with_llm,
+    compute_stylometric_score, compute_informality_score,
+    compute_code_structure_score, aggregate_confidence,
+)
 import audit_log
 import certificates
 import analytics
@@ -37,6 +41,7 @@ LABELS = {
 CONFIDENCE_THRESHOLD = 0.80
 PROCESS_STATEMENT_MIN_LENGTH = 100
 PROCESS_STATEMENT_HUMAN_THRESHOLD = 0.6
+SUPPORTED_CONTENT_TYPES = ("text", "code")
 
 
 def _label_for(classification: str, confidence: float) -> str:
@@ -59,14 +64,27 @@ def submit():
     if not body.get("creator_id"):
         return jsonify({"error": "creator_id is required"}), 422
 
+    content_type = body.get("content_type", "text")
+    if content_type not in SUPPORTED_CONTENT_TYPES:
+        return jsonify({
+            "error": f"content_type must be one of: {', '.join(SUPPORTED_CONTENT_TYPES)}"
+        }), 422
+
     content_id = str(uuid.uuid4())
     creator_id = body["creator_id"]
 
-    llm_score = classify_with_llm(text)
-    stylometric_score = compute_stylometric_score(text)
-    informality_score = compute_informality_score(text)
-    result = aggregate_confidence(llm_score, stylometric_score, informality_score)
+    if content_type == "code":
+        llm_score = classify_code_with_llm(text)
+        signal_2_score = compute_code_structure_score(text)
+        signal_3_score = compute_stylometric_score(text)
+        signal_names = ("llm_score", "code_structure_score", "text_stylometric_score")
+    else:
+        llm_score = classify_with_llm(text)
+        signal_2_score = compute_stylometric_score(text)
+        signal_3_score = compute_informality_score(text)
+        signal_names = ("llm_score", "stylometric_score", "informality_score")
 
+    result = aggregate_confidence(llm_score, signal_2_score, signal_3_score)
     classification = result["classification"]
     confidence = result["confidence"]
     label = _label_for(classification, confidence)
@@ -74,24 +92,26 @@ def submit():
     audit_log.append_entry({
         "content_id": content_id,
         "creator_id": creator_id,
+        "content_type": content_type,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "attribution": classification,
         "confidence": confidence,
-        "llm_score": round(llm_score, 2),
-        "stylometric_score": round(stylometric_score, 2),
-        "informality_score": round(informality_score, 2),
+        signal_names[0]: round(llm_score, 2),
+        signal_names[1]: round(signal_2_score, 2),
+        signal_names[2]: round(signal_3_score, 2),
         "status": "classified",
     })
 
     return jsonify({
         "content_id": content_id,
+        "content_type": content_type,
         "classification": classification,
         "confidence": confidence,
         "label": label,
         "signals": {
-            "llm_score": round(llm_score, 2),
-            "stylometric_score": round(stylometric_score, 2),
-            "informality_score": round(informality_score, 2),
+            signal_names[0]: round(llm_score, 2),
+            signal_names[1]: round(signal_2_score, 2),
+            signal_names[2]: round(signal_3_score, 2),
         },
     }), 200
 
