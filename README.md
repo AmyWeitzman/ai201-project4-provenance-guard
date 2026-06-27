@@ -38,7 +38,7 @@ If a user believes their content was misclassified, they can submit an appeal. T
 ### Flow 1: Submission
 
 ```text
-POST /submissions
+POST /submit
         |
         | raw request
         v
@@ -53,46 +53,47 @@ POST /submissions
 └──────────────────┘
         |
         | validated text
-        ├──────────────────────────────┐
-        v                              v
-┌─────────────────┐        ┌──────────────────────┐
-│  LLM Classifier │        │ Stylometric Analyzer  │
-│    (Groq)       │        │   (pure Python)       │
-└─────────────────┘        └──────────────────────┘
-        |                              |
-        | llm_score (0.0-1.0)          | stylometric_score (0.0-1.0)
-        └──────────────┬───────────────┘
-                       v
-           ┌───────────────────────┐
-           │  Confidence           │
-           │  Aggregator           │
-           └───────────────────────┘
-                       |
-                       | classification + confidence score
-                       v
-           ┌───────────────────────┐
-           │   Label Generator     │
-           └───────────────────────┘
-                       |
-                       | label text
-                       v
-           ┌───────────────────────┐
-           │    Audit Logger       │
-           └───────────────────────┘
-                       |
-                       | full decision written to log
-                       v
-           ┌───────────────────────────────────────┐
-           │  Response to caller                   │
-           │  content_id, classification,          │
-           │  confidence, label, signal scores     │
-           └───────────────────────────────────────┘
+        ├──────────────────┬──────────────────────────┐
+        v                  v                          v
+┌─────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+│  LLM Classifier │  │ Stylometric Analyzer  │  │ Informality Analyzer │
+│    (Groq)       │  │   (pure Python)       │  │   (pure Python)      │
+└─────────────────┘  └──────────────────────┘  └──────────────────────┘
+        |                  |                          |
+        | llm_score        | stylometric_score        | informality_score
+        └──────────────────┴──────────────────────────┘
+                                   |
+                                   v
+                       ┌───────────────────────┐
+                       │  Confidence           │
+                       │  Aggregator           │
+                       └───────────────────────┘
+                                   |
+                                   | classification + confidence score
+                                   v
+                       ┌───────────────────────┐
+                       │   Label Generator     │
+                       └───────────────────────┘
+                                   |
+                                   | label text
+                                   v
+                       ┌───────────────────────┐
+                       │    Audit Logger       │
+                       └───────────────────────┘
+                                   |
+                                   | full decision written to log
+                                   v
+                       ┌───────────────────────────────────────┐
+                       │  Response to caller                   │
+                       │  content_id, classification,          │
+                       │  confidence, label, signal scores     │
+                       └───────────────────────────────────────┘
 ```
 
 ### Flow 2: Appeal
 
 ```text
-POST /appeals/{content_id}
+POST /appeal/{content_id}
         |
         | content_id + reasoning
         v
@@ -341,13 +342,13 @@ The certificate does not re-run the detection signals or override the original c
 
 Applied to `POST /submit` only. `/appeal` and `/log` are not rate-limited.
 
-**Limits:** 10 requests per minute, 100 requests per day, per IP address.
+**Limits:** 10 requests per minute, per `creator_id`.
 
 **Reasoning:**
 
 - A writer submitting their own work will rarely exceed a few submissions per session. 10 per minute is generous for human-paced use — it would take deliberate effort to hit.
 - Every submission calls the Groq API, which adds latency and counts against the free-tier token budget. Unlimited submissions would bottleneck on the upstream API anyway.
-- 100 per day accommodates a heavy user batch-submitting a full portfolio without enabling overnight automated flooding.
+- Keying by `creator_id` rather than IP allows multiple users on the same network (e.g., a classroom or shared workspace) to each get their own quota, rather than a single shared pool.
 - The per-minute limit is the real abuse guard. A script in a tight loop hits the wall immediately; a person typing and submitting work never would.
 
 **Evidence — rate limit in action** (12 rapid requests, limit is 10/min):
@@ -637,14 +638,14 @@ The share of `human_authored` submissions that went on to earn a provenance cert
 
 Returns the full certificate record including `process_statement` and `statement_score`.
 
-### `POST /appeal`
+### `POST /appeal/<content_id>`
 
 **Request body:**
 
 ```json
 {
-  "content_id": "uuid from /submit response",
-  "user_reasoning": "string (required)"
+  "creator_id": "string (must match original submission)",
+  "reasoning": "string (required, min 20 characters)"
 }
 ```
 
@@ -654,7 +655,7 @@ Returns the full certificate record including `process_statement` and `statement
 {
   "content_id": "uuid",
   "status": "under_review",
-  "message": "Your appeal has been received and will be reviewed by our team."
+  "message": "Your appeal has been submitted and the content is now under review."
 }
 ```
 

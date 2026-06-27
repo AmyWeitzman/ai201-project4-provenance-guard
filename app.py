@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from flask_limiter import Limiter
 from signals import (
     classify_with_llm, classify_code_with_llm,
     compute_stylometric_score, compute_informality_score,
@@ -14,6 +15,11 @@ import analytics
 load_dotenv()
 
 app = Flask(__name__)
+def _get_creator_id():
+    body = request.get_json(silent=True) or {}
+    return body.get("creator_id") or "anonymous"
+
+limiter = Limiter(_get_creator_id, app=app, default_limits=[])
 
 LABELS = {
     "ai_generated": (
@@ -51,6 +57,7 @@ def _label_for(classification: str, confidence: float) -> str:
 
 
 @app.route("/submit", methods=["POST"])
+@limiter.limit("10 per minute")
 def submit():
     body = request.get_json(silent=True)
 
@@ -191,6 +198,41 @@ def get_certificate(certificate_id):
     if not cert:
         return jsonify({"error": "certificate not found"}), 404
     return jsonify(cert), 200
+
+
+@app.route("/appeal/<content_id>", methods=["POST"])
+def appeal(content_id):
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "request body must be JSON"}), 422
+
+    creator_id = body.get("creator_id")
+    reasoning = body.get("reasoning", "")
+
+    if not creator_id:
+        return jsonify({"error": "creator_id is required"}), 422
+    if not reasoning or len(reasoning.strip()) < 20:
+        return jsonify({"error": "reasoning must be at least 20 characters"}), 422
+
+    entry = audit_log.find_entry(content_id)
+    if not entry:
+        return jsonify({"error": "content_id not found"}), 404
+    if entry.get("creator_id") != creator_id:
+        return jsonify({"error": "creator_id does not match the content's creator"}), 403
+    if entry.get("status") == "under_review":
+        return jsonify({"error": "an appeal is already pending for this content"}), 409
+
+    audit_log.update_entry(content_id, {
+        "status": "under_review",
+        "appeal_reasoning": reasoning.strip(),
+        "appeal_submitted_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    return jsonify({
+        "content_id": content_id,
+        "status": "under_review",
+        "message": "Your appeal has been submitted and the content is now under review.",
+    }), 200
 
 
 @app.route("/analytics", methods=["GET"])
